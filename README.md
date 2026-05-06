@@ -74,3 +74,84 @@ The pipeline determines the next semantic version based on existing Git tags. It
 6. The CI bot clones `gitops-core`, updates the image tag in `values-stage.yaml` using `yq`, and commits the change.
 7. ArgoCD detects the new commit in `gitops-core` and updates the Kubernetes cluster.
 8. The External Secrets Operator fetches the database password from AWS Secrets Manager and injects it into the new Pods.
+## Initial Platform Setup
+
+This section covers how to bootstrap the platform from scratch in a new AWS account. We use Workload Identity Federation (OIDC) so GitHub Actions can talk to AWS without us storing static `AWS_ACCESS_KEY_ID` secrets.
+
+### 1. Configure AWS OIDC
+
+We need to tell AWS to trust our GitHub organization. Run this locally with an admin AWS profile:
+
+```bash
+export AWS_PROFILE="aws"
+export GITHUB_ORG="App-of-apps-argo-example" # Change to your org
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+
+# 1. Register GitHub as an OIDC provider in AWS
+aws iam create-open-id-connect-provider \
+  --url "https://token.actions.githubusercontent.com" \
+  --client-id-list "sts.amazonaws.com" \
+  --thumbprint-list "1b511abead59c6ce207077c0bf0e0043b1382612"
+
+# 2. Create the trust policy
+cat <<POLICY > trust-policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:${GITHUB_ORG}/*"
+        },
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+POLICY
+
+# 3. Create the GitHub Actions role
+aws iam create-role \
+  --role-name GitHubActionsDeployRole \
+  --assume-role-policy-document file://trust-policy.json
+
+# 4. Attach admin permissions (scope this down for production!)
+aws iam attach-role-policy \
+  --role-name GitHubActionsDeployRole \
+  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+```
+
+Update your GitHub Actions workflows to use `arn:aws:iam::<ACCOUNT_ID>:role/GitHubActionsDeployRole`.
+
+### 2. GitHub Secrets Setup
+
+Create a Personal Access Token (PAT) with repository access and add it as an Organization Secret in GitHub:
+- **Name:** `GITOPS_BOT_TOKEN`
+- **Value:** `<your-pat>`
+
+The central pipeline uses this token to clone the `gitops-core` repo, bump image tags, and push the changes back.
+
+### 3. Provision Infrastructure
+
+Head to the `terraform` repository on GitHub. Go to the **Actions** tab, select the **Deploy EKS and ArgoCD** workflow, and run it.
+
+What Terraform does:
+1. **State Bootstrap:** It dynamically creates an S3 bucket and a DynamoDB table for Terraform state if they don't exist.
+2. **VPC & EKS:** It provisions the network and a Kubernetes 1.35 cluster.
+3. **ECR:** It creates container registries for each microservice with a lifecycle policy (keeps the last 20 images).
+4. **ArgoCD:** It installs ArgoCD using Helm and tells it to watch the `gitops-core` repository to bootstrap the rest of the cluster (App-of-Apps).
+
+### 4. Deploy Applications
+
+Once the EKS cluster is up and ArgoCD is running, push code to `microservice-a`, `microservice-b`, or `microservice-c`.
+1. GitHub Actions builds a multi-arch image and pushes it to ECR.
+2. It tags the release based on Git history.
+3. It updates the image tag in `gitops-core` (e.g., `applications/main/values-stage.yaml`).
+4. ArgoCD detects the change and rolls out the new version to Kubernetes.
